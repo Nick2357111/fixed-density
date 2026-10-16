@@ -1,0 +1,44 @@
+{
+  "onebot": {
+    "ws_url": "ws://127.0.0.1:3001",
+    "access_token": "",
+    "reconnect_delay_sec": 5,
+    "request_timeout_sec": 30,
+    "command_prefix": "/rework"
+  },
+
+  "render": {
+    "plugin_dir": "../ManiaMapAnalyser.by.Leo_Black",
+    "host": "127.0.0.1",
+    "port": 24750,
+    "browser_channel": "msedge",
+    "headless": true,
+    "device_scale_factor": 2,
+    "page_timeout_ms": 180000,
+    "settle_ms": 1500
+  },
+
+  "osu": {
+    "beatmap_url": "https://osu.direct/api/osu/{id}",
+    "beatmapset_url": "https://osu.direct/api/d/{id}",
+    "user_agent": "qqbot-rework/1.0 (+https://github.com/LeoBlackMT/osumania_map_analyser)",
+    "timeout_sec": 60,
+    "max_beatmaps_per_pack": 40,
+    "include_background": true
+  },
+
+  "output": {
+    "temp_dir": "temp",
+    "keep_files": true,
+    "send_as_forward": true,
+    "forward_name": "Rework 谱面分析",
+    "forward_uin": "10000"
+  },
+
+  "access": {
+    "allow_group": true,
+    "allow_private": true,
+    "group_allowlist": [],
+    "user_denylist": []
+  }
+}
