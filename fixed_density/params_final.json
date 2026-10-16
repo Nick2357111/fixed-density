@@ -1,0 +1,66 @@
+{
+  "_comment": "Fixed Density v1 的冻结模型。算法参数与 tosu 插件 js/fixedDensity/index.js 中「冻结最优参数」逐字一致；fit / ln_calibration 为最终的标定产物。修改这里会同时改变 value.py 与报告默认口径，请谨慎。",
+  "algorithm": "object_sequence",
+  "params": {
+    "half_life_ms": 306.625,
+    "quantile": 0.91162709,
+    "extra_rate": 2.0524655999999997,
+    "extra_b": 2.337995528948387,
+    "extra_log_base": 4.012384,
+    "soft_beta": 0.706887,
+    "irr_gain_lane": 0.1,
+    "irr_gain_pair": 0.0,
+    "irr_gain_global": 0.06,
+    "irr_local_gain": 0.0,
+    "cross_lane_mix": 0.0,
+    "merge_power": 1000.0,
+    "merge2_power": 100.0,
+    "contrib_power": 300.0,
+    "ln_gain": 0.0,
+    "ln_rel_power": 3.28936,
+    "ln_jack_gain": 2.369768,
+    "ln_hold_gain": -0.028644,
+    "ln_cross_gain": 16.067968,
+    "ln_len_weight_gain": 1.0,
+    "ln_hold_ref_ms": 40.0,
+    "ln_absorb_gain": 0.25,
+    "ln_mult_rel": 0.1,
+    "ln_mult_jack": 0.4,
+    "ln_mult_cross": 0.0,
+    "ln_mult_hold": 0.2,
+    "ln_mult_exp": 6.0,
+    "ln_mult_rho_c": 0.33,
+    "ln_mult_rho_lin": 0.1
+  },
+  "fit": {
+    "map_knots": [
+      [0.3, 1.6],
+      [2.45, 1.6],
+      [3.85, 0.9],
+      [4.5, 2.0],
+      [7.1, 1.6],
+      [12.05, 0.9],
+      [12.65, 0.9]
+    ],
+    "map_coef": [
+      2.2337506713451534,
+      0.24999999999999997,
+      0.06000000000000313,
+      0.24999999999958641,
+      0.06000000000000012,
+      0.23074460079088877,
+      0.06000000000733659,
+      0.07373131195591297,
+      0.17858296244098779,
+      -0.03290469294378953,
+      -0.028511990541329264
+    ],
+    "C": 0.0,
+    "E": -0.03290469294378953,
+    "D": -0.028511990541329264
+  },
+  "ln_calibration": {
+    "a": 5.44200375179058,
+    "b": 0.0960408821250538
+  }
+}

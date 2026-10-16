@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# 调参产物（可复现，不入库）
+tune_log*.jsonl
+best_params*.json
+build/best_params*.json

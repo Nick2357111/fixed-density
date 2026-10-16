@@ -1,0 +1,7 @@
+# Fixed Density：运行与报告所需依赖
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+
+# 仅 fixed_density.tune（贝叶斯调参）需要
+scikit-learn>=1.3
