@@ -42,6 +42,15 @@ examples/... [42].osu
 `dict(rc_value, ln_value, n, k, chord)`。`--rate 1.5` 表示 DT、`0.75` 表示 HT，
 时间戳按 `1/rate` 缩放，与插件采用相同的处理方式。
 
+需要完整中间量时，可用工作流命令直接输出 JSON：
+
+```powershell
+python -m fixed_density.workflow "examples/Saikoro - far in the blue sky... (1nar) [42].osu"
+```
+
+`rc` 与 `ln` 各含 `n`（分位数）、`fitted`（映射曲线空间的拟合值）、`mapped`（反解回原始 value 尺度后的值）。
+LN 通道的 `n` 为 `n_LN = k · n_RC`，另有 `k` 便于核对。
+
 ---
 
 ## 2. 目录结构
@@ -50,6 +59,7 @@ examples/... [42].osu
 fixed_density/
 ├─ core.py            算法核心：参数注册表、物件赋值序列算法、LN 通道与映射曲线（仅依赖 numpy）
 ├─ value.py           求值接口：.osu 或 (t,l) 序列 → rc_value / ln_value（CLI）
+├─ workflow.py        完整工作流 CLI：.osu → JSON（rc/ln 的 n、拟合值、映射后值）
 ├─ reader.py          .osu → 逐轨 (t, l) 序列
 ├─ benchmark.py       基准运行、曲线拟合、统计与单文件 HTML 报告（CLI）
 ├─ ln_benchmark.py    LN 参考难度评测报告（CLI）

@@ -8,6 +8,7 @@
 子模块：
     fixed_density.core           算法核心（参数注册表 / object_sequence / 映射曲线）
     fixed_density.value          端到端求值（.osu 或 (t,l) 列表 → value）
+    fixed_density.workflow       完整工作流 CLI（.osu → JSON：n / 拟合值 / 映射后值）
     fixed_density.reader         .osu → 逐轨 (t, l) 列表
     fixed_density.benchmark      benchmark 运行 / 拟合 / 统计 / HTML 报告（CLI）
     fixed_density.ln_benchmark   LN 参考难度 benchmark 报告（CLI）
