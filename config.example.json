@@ -35,6 +35,12 @@
     "forward_uin": "10000"
   },
 
+  "storage": {
+    "data_dir": "data",
+    "enable_cache": true,
+    "max_sent_records": 5000
+  },
+
   "access": {
     "allow_group": true,
     "allow_private": true,

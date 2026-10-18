@@ -14,14 +14,20 @@
 | `/rework bid<谱面ID>` / `b<ID>` | 同上（显式指定谱面 ID；`b`、`bid` 与数字之间可省略空格，写 `bid 123` 亦可） |
 | `/rework sid<谱包ID>` / `s<ID>` | 分析整个谱包，**以聊天记录（合并转发）形式发送多张图片** |
 | `/rework <osu! 链接>` | 支持 `osu.ppy.sh/beatmapsets/...`、`/beatmaps/...`、`/b/...`、`/s/...` |
-| 回复一条谱面文件并发送 `/rework` | 支持 `.osu` / `.osz`（osu!）与 `.mc` / `.mcz`（Malody）；多张谱面会以聊天记录形式发送 |
+| 回复一条谱面文件并发送 `/rework` | 支持 `.osu` / `.osz` / `.mc` / `.mcz`，以及**任意 `.zip` 压缩包**（可嵌套，自动扫描包内所有目录）；多张谱面会以聊天记录形式发送 |
+| 回复机器人图片发送 `/report <rc> [ln]` | 提交实际体感难度；谱包（合并转发）用 `/report <编号> <rc> [ln]`，编号从 1 开始 |
+
+**容器读取**：`.osz` / `.mcz` / `.zip` 统一按 zip 处理，递归遍历**包内所有目录**，收集其中的
+`.osu`、`.mc`，并对嵌套的 `.osz` / `.mcz` / `.zip` 继续展开（最多 4 层，含条目数与解压体积上限）。
+同一包内重复的谱面会按内容去重。
 
 **Malody 支持**：`.mc` / `.mcz` 会先在本地按 **模式 + 轨道数** 校验，再转换为一份临时的 `.osu`
-（**laz 形式：物件时间戳保留浮点毫秒**）后交给插件分析。`.mcz` 谱包内多张谱面同样以聊天记录发送。
+（**laz 形式：物件时间戳保留浮点毫秒**）后交给插件分析。
 
 **容错行为**：读取谱面时若 **轨道数不是 4** 或 **不是 osu!mania 谱面**，
 该张谱面的卡片会被**错误提示图片替换**（例如「该谱面为 7K，本工具仅支持 4K mania 谱面。」），
-其余谱面照常输出。Malody 谱面同理（非 Key 模式 / 非 4K 会给出对应提示）。
+其余谱面照常输出。Malody 谱面同理（非 Key 模式 / 非 4K 会给出对应提示）；
+单张渲染失败也只会替换那一张，不会中断整包。
 
 ---
 
@@ -30,15 +36,23 @@
 ```
 qqbot/
 ├─ run.py                  # 入口（启动机器人 / 本地渲染自测）
+├─ refresh_db.py           # 数据库刷新入口（重新渲染全部已缓存谱面）
 ├─ config.json             # 你的配置（首次运行自动由 config.example.json 复制生成）
 ├─ config.example.json     # 配置模板
 ├─ requirements.txt
 ├─ temp/                   # 渲染产物（output.keep_files 为 true 时落地）
+├─ data/                   # 谱面库
+│  ├─ charts/              # <哈希>.osu / <哈希>.png / <哈希>.bg / <哈希>.json
+│  ├─ feedback.json        # 用户反馈
+│  └─ sent_messages.json   # 已发送消息 → 谱面哈希索引
 └─ reworkbot/
    ├─ config.py            # 配置加载
    ├─ beatmap.py           # .osu 解析与 4K mania 校验
-   ├─ malody.py            # .mc / .mcz 解析与转换为 .osu（laz 浮点时间戳）
-   ├─ osu_source.py        # 镜像站下载 / 压缩包解包 / 链接解析
+   ├─ archive.py           # 统一压缩包扫描（.osz/.mcz/.zip，含嵌套）
+   ├─ malody.py            # .mc 解析与转换为 .osu（laz 浮点时间戳）
+   ├─ cache.py             # 哈希谱面库（命中直接复用图片）
+   ├─ feedback.py          # 用户反馈 + 发送索引
+   ├─ osu_source.py        # 镜像站下载 / 链接解析 / 本地读取
    ├─ onebot.py            # OneBot v11 客户端（收发消息、合并转发）
    ├─ renderer.py          # 本地静态服务 + 无头浏览器截图（核心）
    ├─ errorcard.py         # 错误提示图片
@@ -172,6 +186,9 @@ python run.py --log-file .\logs\qqbot.log    # 同时写入滚动日志文件（
 | `osu.include_background` | 是否使用谱面包内的背景图（卡片封面垫图 + 取色） |
 | `output.keep_files` | 是否把 PNG 落地到 `temp/` 便于排查 |
 | `output.send_as_forward` | 多张谱面时是否用合并转发 |
+| `storage.data_dir` | 谱面库目录，默认 `data`（相对配置文件） |
+| `storage.enable_cache` | 是否启用哈希缓存；关掉则每次都重新渲染 |
+| `storage.max_sent_records` | 发送索引保留条数（供 `/report` 定位，默认 5000） |
 | `access.*` | 群聊/私聊开关、群白名单、用户黑名单 |
 
 **谱面镜像**：默认使用 `osu.direct`。若该镜像不可用，可换成其他镜像，例如
@@ -237,9 +254,33 @@ tosu 的 WebSocket 断连只会在后台重试。因此本项目：
 - **时间戳为 lazer 形式**：物件与 TimingPoint 的时间都保留浮点毫秒、不取整，
   避免转换引入系统性偏差。
 - **OD 取 8**：Malody 没有 OD 概念，转换时固定写 `OverallDifficulty:8`（osu! 默认值）。
-- 转换出的临时 `.osu` 会在 `output.keep_files` 为 true 时落到 `temp/`，便于核对转换结果。
+- 转换结果会作为谱面文本存进 `data/charts/<哈希>.osu`，可直接打开核对。
 - `.mcz` 内的背景图会用于卡片封面垫图与取色。
 - 旧版 Malody 的数组式音符格式暂不支持，会给出明确提示而不是产出错误结果。
+
+### 6.2 谱面库（哈希缓存）
+
+每次查询都会把**最终用于分析的那份 `.osu` 文本**做 SHA-256 作为键，落盘到 `data/charts/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `<哈希>.osu` | 谱面文本（Malody 则是转换后的结果） |
+| `<哈希>.png` | 生成的分析卡片 |
+| `<哈希>.bg` | 可选背景图（刷新时用来还原封面） |
+| `<哈希>.json` | 名称、来源、创建/更新时间 |
+
+再次查询到同一谱面时（包括来自不同谱包、改了文件名的同一份内容）**直接复用已有图片，不再渲染**，
+日志会显示 `命中历史结果（<哈希前12位>…）`。
+
+想强制重算：删除 `data/charts/` 下对应文件，或直接跑 `refresh_db.py`。
+
+### 6.3 用户反馈（/report）
+
+- 回复机器人发出的图片，发送 `/report <rc> [ln]`。
+- 谱包发的是**合并转发**，需要 `/report <编号> <rc> [ln]`，编号从 1 开始（表头不计入）。
+- 只填一个数值时按 **RC** 处理（LN 留空）。
+- 同一用户对同一谱面只保留一条记录，重复提交会覆盖并回执「已更新」。
+- 数据存于 `data/feedback.json`，键为 `<用户QQ>|<谱面哈希>`；错误提示图片没有谱面哈希，无法反馈。
 
 ---
 
@@ -249,12 +290,21 @@ tosu 的 WebSocket 断连只会在后台重试。因此本项目：
 # 单张谱面
 python run.py --render "..\benchmark\ln\Xyris - Eviternity [LN Eviternity].osu" --out .\temp\out.png
 
-# 谱包（.osz / .zip）
+# 谱包 / 任意 zip（自动递归嵌套容器）
 python run.py --render .\temp\pack.osz --out .\temp
 
 # 非 4K / 非 mania 谱面 -> 输出错误提示图片，进程退出码 2
 python run.py --render .\sevenK.osu --out .\temp
 ```
+
+**刷新整个谱面库**（改过插件设置或升级插件后，统一重算所有缓存图片）：
+
+```powershell
+python refresh_db.py --dry-run     # 先看看有哪些条目
+python refresh_db.py               # 重新渲染并覆盖全部 <哈希>.png
+```
+
+刷新会逐条打印 `[i/N] 谱面名 已刷新（大小，耗时）`，失败的条目保留原图并计入失败数。
 
 ---
 
@@ -266,3 +316,6 @@ python run.py --render .\sevenK.osu --out .\temp
   若你手工改过 `PRESET_OVERRIDES` 请勿删除 `wsEndpoint` 的注入。
 - **`/rework <ID>` 报「镜像站返回的不是谱面文件」**：镜像限流或 ID 不存在，换镜像或改用回复文件。
 - **谱包很大时很久**：谱面逐张串行渲染，可用 `osu.max_beatmaps_per_pack` 限制，或改用谱面 ID。
+- **`.mcz` / `.osz` 里其实放的是 `.osu` 或嵌套压缩包**：现在统一按 zip 处理，会自动递归扫描所有目录。
+- **改了插件设置后图片没变**：这是哈希缓存的正常行为，跑一次 `python refresh_db.py` 重算即可。
+- **`/report` 提示找不到对应谱面**：发送索引只保留最近 `storage.max_sent_records` 条，且重启前发送的消息在索引清空后无法定位。

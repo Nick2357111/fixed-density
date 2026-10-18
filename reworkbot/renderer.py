@@ -391,6 +391,10 @@ class Renderer:
         star = str(info["star"]).strip()
         if not star or star == "-":
             raise RenderError("插件未能产出分析结果（星等为空）。")
+        # 插件内部报错时仍会画出星等，但状态行以 [Error] 开头 —— 这种结果是假的，不能发出去
+        status_text = str(info.get("status") or "").strip()
+        if status_text.startswith("[Error]"):
+            raise RenderError(status_text)
         logger.info("  分析完成：星等=%s（用时 %.1fs）", star, time.perf_counter() - load_started)
 
         # 封面主题：正常运行时由 tosu 的 socket payload 触发，离线渲染没有 socket，
@@ -412,9 +416,12 @@ class Renderer:
         await page.evaluate("() => { document.body.style.background = '#000000'; }")
 
         final = await page.evaluate(_READY_CHECK_JS)
+        final_status = str(final.get("status") or "")
+        if final_status.startswith("[Error]"):
+            raise RenderError(final_status)
         logger.info(
             "  卡片就绪：谱面=%s  星等=%s",
-            final.get("status") or "未知",
+            final_status or "未知",
             final.get("star") or "?",
         )
 

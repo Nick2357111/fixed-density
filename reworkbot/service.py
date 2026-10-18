@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -15,10 +16,12 @@ from urllib.request import url2pathname
 
 import aiohttp
 
-from . import malody, osu_source
+from . import archive, osu_source
 from .beatmap import BeatmapInfo, parse_beatmap
+from .cache import ChartCache
 from .config import AppConfig
 from .errorcard import render_error_card
+from .feedback import FeedbackStore, SentMessageIndex
 from .onebot import (
     OneBotClient,
     extract_plain_text,
@@ -31,6 +34,8 @@ from .renderer import RenderError, Renderer
 
 logger = logging.getLogger(__name__)
 
+REPORT_PREFIX = "/report"
+
 HELP_TEXT = (
     "【Rework 谱面分析】\n"
     "/rework <谱面ID>       分析单张谱面\n"
@@ -38,8 +43,13 @@ HELP_TEXT = (
     "/rework sid<谱包ID>    分析整个谱包（合并转发发送，亦可 s<ID>）\n"
     "/rework <osu! 链接>   支持官网谱面 / 谱包链接\n"
     "回复一条谱面文件并发送 /rework\n"
-    "  支持 .osu / .osz（osu!）与 .mc / .mcz（Malody）\n"
-    "（仅支持 4K mania / Malody Key 4K 谱面）"
+    "  支持 .osu / .osz / .mc / .mcz，以及内含它们的 .zip（可嵌套）\n"
+    "（仅支持 4K mania / Malody Key 4K 谱面）\n"
+    "\n"
+    "【反馈实际难度】\n"
+    "/report <rc> [ln]           回复机器人发送的图片\n"
+    "/report <编号> <rc> [ln]    回复谱包（合并转发）时指定第几张\n"
+    "  编号从 1 开始；只填一个数值时视为 RC"
 )
 
 _ID_RE = re.compile(r"^\d+$")
@@ -65,6 +75,7 @@ class ResultItem:
     info: BeatmapInfo | None
     png: bytes | None = None
     error: str | None = None
+    key: str | None = None  # 谱面哈希（错误卡片为 None）
 
 
 def parse_command(text: str, prefix: str) -> Command | None:
@@ -98,15 +109,50 @@ def parse_command(text: str, prefix: str) -> Command | None:
     return Command(kind="help")
 
 
+def is_report_command(text: str) -> bool:
+    normalized = text.strip().replace("／", "/").lower()
+    return normalized == REPORT_PREFIX or normalized.startswith(REPORT_PREFIX + " ")
+
+
+def parse_report_numbers(text: str) -> list[float] | None:
+    """解析 /report 后面的数值；含非数字时返回 None。"""
+    normalized = text.strip().replace("／", "/")
+    rest = normalized[len(REPORT_PREFIX):].strip()
+    if not rest:
+        return []
+    numbers: list[float] = []
+    for token in rest.replace(",", " ").split():
+        try:
+            value = float(token)
+        except ValueError:
+            return None
+        if not math.isfinite(value):
+            return None
+        numbers.append(value)
+    return numbers
+
+
 class ReworkService:
     def __init__(self, cfg: AppConfig, client: OneBotClient, renderer: Renderer) -> None:
         self.cfg = cfg
         self.client = client
         self.renderer = renderer
         self._session: aiohttp.ClientSession | None = None
+        self.cache = ChartCache(cfg.data_dir, enabled=cfg.storage.enable_cache)
+        self.feedback = FeedbackStore(cfg.data_dir / "feedback.json")
+        self.sent = SentMessageIndex(
+            cfg.data_dir / "sent_messages.json",
+            max_records=cfg.storage.max_sent_records,
+        )
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
+        charts, images = self.cache.stats()
+        logger.info(
+            "谱面库：%d 条记录 / %d 张图片（缓存%s）",
+            charts, images, "开启" if self.cfg.storage.enable_cache else "关闭",
+        )
+        logger.info("反馈记录：%d 条；发送索引：%d 条", len(self.feedback), len(self.sent))
 
     async def close(self) -> None:
         if self._session is not None:
@@ -122,13 +168,21 @@ class ReworkService:
 
         message = event.get("message")
         text = extract_plain_text(message if isinstance(message, list) else None)
-        command = parse_command(text, self.cfg.onebot.command_prefix)
-        if command is None:
-            return
 
         message_type = event.get("message_type", "private")
         group_id = event.get("group_id")
         user_id = event.get("user_id")
+
+        if is_report_command(text):
+            tag = f"[#{next(_request_seq)}]"
+            scope = f"群 {group_id}" if message_type == "group" else f"用户 {user_id}"
+            logger.info("%s 收到反馈：%r（来自%s）", tag, text.strip(), scope)
+            await self._handle_report(event, text, message_type, group_id, user_id, tag)
+            return
+
+        command = parse_command(text, self.cfg.onebot.command_prefix)
+        if command is None:
+            return
 
         tag = f"[#{next(_request_seq)}]"
         scope = f"群 {group_id}" if message_type == "group" else f"用户 {user_id}"
@@ -184,6 +238,102 @@ class ReworkService:
         denylist = [str(u) for u in access.user_denylist]
         return str(event.get("user_id")) not in denylist
 
+    # ------------------------------------------------------------------ 用户反馈
+    @staticmethod
+    def _reply_id_of(event: dict[str, Any]) -> str | None:
+        for segment in event.get("message") or []:
+            if segment.get("type") == "reply":
+                return segment.get("data", {}).get("id")
+        return None
+
+    async def _handle_report(
+        self,
+        event: dict[str, Any],
+        text: str,
+        message_type: str,
+        group_id: Any,
+        user_id: Any,
+        tag: str,
+    ) -> None:
+        """处理 /report：把用户实际体感难度写入反馈库。"""
+
+        async def reply(segments: list[dict[str, Any]]) -> None:
+            await self.client.send_msg(
+                message_type=message_type,
+                group_id=group_id,
+                user_id=user_id,
+                message=segments,
+            )
+
+        reply_id = self._reply_id_of(event)
+        if reply_id is None:
+            logger.info("%s 反馈未附带回复", tag)
+            await reply([text_segment("请回复机器人发送的分析图片，再发送 /report <rc> [ln]。")])
+            return
+
+        record = self.sent.get(reply_id)
+        if record is None:
+            logger.warning("%s 反馈的消息 %s 不在发送索引中", tag, reply_id)
+            await reply([
+                text_segment("找不到这条消息对应的谱面（可能是机器人重启前发送的）。")
+            ])
+            return
+
+        numbers = parse_report_numbers(text)
+        if not numbers:
+            await reply([
+                text_segment("用法：/report <rc> [ln]；谱包请用 /report <编号> <rc> [ln]")
+            ])
+            return
+
+        total = len(record.keys)
+        if total > 1:
+            # 合并转发：第一个数必须是图片编号
+            if len(numbers) < 2:
+                await reply([
+                    text_segment(f"这是谱包结果，请指定图片编号：/report <1-{total}> <rc> [ln]")
+                ])
+                return
+            index = int(numbers[0])
+            if numbers[0] != index or not (1 <= index <= total):
+                await reply([text_segment(f"图片编号必须是 1 到 {total} 之间的整数。")])
+                return
+            rc = numbers[1]
+            ln = numbers[2] if len(numbers) >= 3 else None
+        else:
+            if len(numbers) > 2:
+                await reply([text_segment("用法：/report <rc> [ln]")])
+                return
+            index = 1
+            rc = numbers[0]
+            ln = numbers[1] if len(numbers) >= 2 else None
+
+        for value in (rc, ln):
+            if value is not None and not (0 < value <= 100):
+                await reply([text_segment("难度数值需在 0 到 100 之间。")])
+                return
+
+        chart_key = record.keys[index - 1]
+        chart_name = record.names[index - 1] if index - 1 < len(record.names) else ""
+        if not chart_key:
+            await reply([text_segment("该图片是错误提示，没有可反馈的谱面。")])
+            return
+
+        created = self.feedback.upsert(user_id, chart_key, name=chart_name, rc=rc, ln=ln)
+        body = f"RC {rc:.2f}" + (f" / LN {ln:.2f}" if ln is not None else "")
+        position = f"（第 {index}/{total} 张）" if total > 1 else ""
+        logger.info(
+            "%s 反馈%s：用户 %s -> %s… %s", tag, "新建" if created else "覆盖",
+            user_id, chart_key[:12], body,
+        )
+        await reply([
+            text_segment(
+                f"{'已记录' if created else '已更新'}反馈{position}\n"
+                f"谱面：{chart_name or chart_key[:12]}\n"
+                f"体感：{body}"
+            )
+        ])
+
     # ------------------------------------------------------------------ 谱面来源
     async def _resolve_auto(self, command: Command, tag: str) -> Command:
         """裸 ID：先按谱面 ID 试，失败再按谱包 ID 试。"""
@@ -237,72 +387,12 @@ class ReworkService:
         return beatmaps, ack
 
     def _beatmaps_from_attachment(self, filename: str, data: bytes) -> list[BeatmapFile]:
-        suffix = Path(filename).suffix.lower()
-
-        # Malody 谱面：.mc（单张）/ .mcz（谱包，zip）
-        if suffix == ".mcz":
-            return self._malody_to_beatmaps(filename, malody.read_malody_zip(data))
-        if suffix == ".mc":
-            return self._malody_to_beatmaps(
-                filename, [(filename, malody.read_malody_chart(data, filename), None)]
-            )
-
-        if suffix in (".osz", ".zip") or data[:2] == b"PK":
-            # 容器里的实际内容可能是 .osu（.osz）也可能是 .mc（被改名的 .mcz）
-            malody_entries: list[tuple[str, Any, bytes | None]] = []
-            try:
-                malody_entries = malody.read_malody_zip(data)
-            except OsuSourceError:
-                malody_entries = []
-            if malody_entries:
-                return self._malody_to_beatmaps(filename, malody_entries)
-
-            beatmaps = osu_source.extract_beatmaps_from_zip(data)
-            if not beatmaps:
-                raise OsuSourceError(f"{filename} 内没有找到任何 .osu / .mc 谱面文件。")
-            return beatmaps
-
-        text = osu_source.decode_osu_text(data)
-        if text.lstrip().startswith(osu_source.OSU_MAGIC):
-            return [BeatmapFile(filename=filename, text=text)]
-
-        # 扩展名不可靠时按内容嗅探 Malody JSON
-        if malody.is_malody_payload(data):
-            return self._malody_to_beatmaps(
-                filename, [(filename, malody.read_malody_chart(data, filename), None)]
-            )
-
-        raise OsuSourceError(f"{filename} 不是有效的 .osu / .mc 谱面文件。")
-
-    def _malody_to_beatmaps(
-        self, filename: str, entries: list[tuple[str, Any, bytes | None]]
-    ) -> list[BeatmapFile]:
-        """把 Malody 转换结果包装成统一的 BeatmapFile（含已判定不可用的条目）。"""
-        results: list[BeatmapFile] = []
-        for entry_name, chart, background in entries:
-            name = entry_name or filename
-            if chart.ok:
-                logger.info(
-                    "  Malody 转换完成：%s（%dK，%d 音符 / %d 长按）",
-                    chart.display_name, chart.key, chart.notes, chart.holds,
-                )
-                self._save_temp_text(Path(name).stem, chart.osu_text, ".osu")
-                results.append(
-                    BeatmapFile(
-                        filename=name,
-                        text=chart.osu_text,
-                        background=background,
-                        name=chart.display_name,
-                    )
-                )
-            else:
-                logger.warning("  Malody 谱面不可用：%s -> %s", chart.display_name, chart.error)
-                results.append(
-                    BeatmapFile(filename=name, text="", name=chart.display_name, error=chart.error)
-                )
-        if not results:
-            raise OsuSourceError(f"{filename} 内没有可用的 Malody 谱面。")
-        return results
+        # 统一交给 archive：.osu / .mc / 任意 zip（.osz / .mcz / .zip，可递归嵌套）
+        beatmaps = archive.collect(data, filename)
+        for beatmap in beatmaps:
+            if beatmap.error:
+                logger.warning("  不可用：%s -> %s", beatmap.display_name, beatmap.error)
+        return beatmaps
 
     async def _files_from_reply(self, event: dict[str, Any], tag: str) -> list[tuple[str, bytes]]:
         reply_id = None
@@ -379,6 +469,7 @@ class ReworkService:
         logger.info("%s 开始处理 %d 张谱面（串行渲染）", tag, total)
 
         items: list[ResultItem] = []
+        hit_count = 0
         for index, beatmap_file in enumerate(files, 1):
             # 读取阶段就已判定不可用（例如 Malody 模式/轨道数不符）
             if beatmap_file.error:
@@ -418,31 +509,63 @@ class ReworkService:
                 f"{len(background) / 1024:.0f} KB" if background else "无",
             )
             item_started = time.perf_counter()
-            png = await self.renderer.render(beatmap_file.text, background)
-            self._save_temp(name, png)
-            logger.info(
-                "%s [%d/%d] 完成，用时 %.1fs（累计 %.1fs）",
-                tag, index, total,
-                time.perf_counter() - item_started,
-                time.perf_counter() - render_started,
-            )
-            items.append(ResultItem(name=name, info=info, png=png))
+            chart_key = self.cache.key_for(beatmap_file.text)
+            cached = self.cache.get_image(chart_key)
+            if cached is not None:
+                png = cached
+                hit_count += 1
+                logger.info(
+                    "%s [%d/%d] 命中历史结果（%s…），直接复用图片",
+                    tag, index, total, chart_key[:12],
+                )
+            else:
+                try:
+                    png = await self.renderer.render(beatmap_file.text, background)
+                except RenderError as exc:
+                    # 单张失败不影响同包其它谱面
+                    logger.error("%s [%d/%d] 渲染失败，改为错误提示：%s", tag, index, total, exc)
+                    message = f"渲染失败：{exc}"
+                    items.append(
+                        ResultItem(
+                            name=name,
+                            info=info,
+                            error=message,
+                            png=render_error_card(message, subtitle=name),
+                        )
+                    )
+                    continue
+                self.cache.put(
+                    chart_key, beatmap_file.text, png,
+                    name=name, source=beatmap_file.filename, background=background,
+                )
+                self._save_temp(name, png)
+                logger.info(
+                    "%s [%d/%d] 渲染并入库 %s…，用时 %.1fs（累计 %.1fs）",
+                    tag, index, total, chart_key[:12],
+                    time.perf_counter() - item_started,
+                    time.perf_counter() - render_started,
+                )
+            items.append(ResultItem(name=name, info=info, png=png, key=chart_key))
 
         ok_count = sum(1 for item in items if not item.error)
         logger.info(
-            "%s 渲染阶段结束：成功 %d 张 / 失败 %d 张，用时 %.1fs",
-            tag, ok_count, len(items) - ok_count, time.perf_counter() - render_started,
+            "%s 渲染阶段结束：成功 %d 张 / 失败 %d 张，其中缓存命中 %d 张，用时 %.1fs",
+            tag, ok_count, len(items) - ok_count, hit_count, time.perf_counter() - render_started,
         )
+
+        keys = [item.key for item in items]
+        names = [item.name for item in items]
 
         if len(items) == 1:
             item = items[0]
             logger.info("%s 发送单张消息（%s）", tag, "错误提示" if item.error else "分析卡片")
-            await self.client.send_msg(
+            result = await self.client.send_msg(
                 message_type=message_type,
                 group_id=group_id,
                 user_id=user_id,
                 message=self._single_message(item),
             )
+            self._remember(result, keys, names, message_type)
             return
 
         nodes = [
@@ -465,20 +588,37 @@ class ReworkService:
 
         if not self.cfg.output.send_as_forward:
             logger.info("%s 逐条发送 %d 张图片（合并转发已关闭）", tag, len(nodes) - 1)
-            for node in nodes[1:]:
-                await self.client.send_msg(
+            for offset, node in enumerate(nodes[1:]):
+                result = await self.client.send_msg(
                     message_type=message_type,
                     group_id=group_id,
                     user_id=user_id,
                     message=node["data"]["content"],
                 )
+                self._remember(result, [keys[offset]], [names[offset]], message_type)
             return
 
         logger.info("%s 发送合并转发：%d 个节点…", tag, len(nodes))
-        await self.client.send_forward(
+        result = await self.client.send_forward(
             message_type=message_type, group_id=group_id, user_id=user_id, nodes=nodes
         )
+        self._remember(result, keys, names, message_type)
         logger.info("%s 合并转发已发送", tag)
+
+    def _remember(
+        self,
+        result: dict[str, Any],
+        keys: list[str | None],
+        names: list[str],
+        message_type: str,
+    ) -> None:
+        """记录「发出的消息 → 谱面哈希」，供 /report 定位。"""
+        message_id = (result.get("data") or {}).get("message_id")
+        if message_id is None:
+            logger.warning("发送结果里没有 message_id，/report 将无法定位这条消息：%s", result)
+            return
+        self.sent.add(message_id, keys, names, message_type=message_type)
+        logger.debug("已记录消息 %s -> %d 张谱面", message_id, len(keys))
 
     def _single_message(self, item: ResultItem) -> list[dict[str, Any]]:
         if item.error:
@@ -499,14 +639,3 @@ class ReworkService:
             self._temp_path(name, ".png").write_bytes(png)
         except OSError as exc:
             logger.debug("保存临时图片失败：%s", exc)
-
-    def _save_temp_text(self, name: str, text: str, suffix: str) -> None:
-        """把中间产物（如 Malody 转换出的临时 .osu）落到 temp 目录，便于排查。"""
-        if not self.cfg.output.keep_files:
-            return
-        try:
-            path = self._temp_path(name, suffix)
-            path.write_text(text, encoding="utf-8")
-            logger.debug("已保存临时谱面：%s", path)
-        except OSError as exc:
-            logger.debug("保存临时谱面失败：%s", exc)

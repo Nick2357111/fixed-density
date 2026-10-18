@@ -76,8 +76,14 @@ async def render_local(cfg: AppConfig, target: str, out: str | None) -> int:
                     logger.warning("[%d/%d] 不可分析，输出错误提示：%s", index, total, info.error)
                     exit_code = 2
                 else:
-                    png = await renderer.render(beatmap_file.text, beatmap_file.background)
-                    logger.info("[%d/%d] 渲染完成（%.1f KB）", index, total, len(png) / 1024)
+                    try:
+                        png = await renderer.render(beatmap_file.text, beatmap_file.background)
+                    except RenderError as exc:
+                        logger.error("[%d/%d] 渲染失败，输出错误提示：%s", index, total, exc)
+                        png = render_error_card(f"渲染失败：{exc}", subtitle=name)
+                        exit_code = 2
+                    else:
+                        logger.info("[%d/%d] 渲染完成（%.1f KB）", index, total, len(png) / 1024)
 
             if out_path is None:
                 destination = cfg.temp_dir / f"{Path(beatmap_file.filename).stem}.png"
@@ -147,6 +153,10 @@ def _log_config_summary(cfg: AppConfig) -> None:
     )
     logger.info("谱面镜像：%s", cfg.osu.beatmap_url)
     logger.info("产物目录：%s（保留文件：%s）", cfg.temp_dir, cfg.output.keep_files)
+    logger.info(
+        "数据库：%s（缓存%s）",
+        cfg.data_dir, "开启" if cfg.storage.enable_cache else "关闭",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

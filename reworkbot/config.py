@@ -65,12 +65,20 @@ class AccessConfig:
 
 
 @dataclass
+class StorageConfig:
+    data_dir: str = "data"
+    enable_cache: bool = True
+    max_sent_records: int = 5000
+
+
+@dataclass
 class AppConfig:
     onebot: OneBotConfig = field(default_factory=OneBotConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     osu: OsuConfig = field(default_factory=OsuConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     access: AccessConfig = field(default_factory=AccessConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     base_dir: Path = field(default_factory=Path.cwd)
     source_path: Path | None = None
 
@@ -81,6 +89,10 @@ class AppConfig:
     @property
     def plugin_dir(self) -> Path:
         return Path(self.render.plugin_dir)
+
+    @property
+    def data_dir(self) -> Path:
+        return Path(self.storage.data_dir)
 
 
 T = TypeVar("T")
@@ -120,6 +132,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         osu=_section(OsuConfig, raw.get("osu"), (), base),
         output=_section(OutputConfig, raw.get("output"), ("temp_dir",), base),
         access=_section(AccessConfig, raw.get("access"), (), base),
+        storage=_section(StorageConfig, raw.get("storage"), ("data_dir",), base),
         base_dir=base,
         source_path=cfg_path,
     )
@@ -130,4 +143,5 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             "请确认 ManiaMapAnalyser.by.Leo_Black 插件目录的位置。"
         )
     cfg.temp_dir.mkdir(parents=True, exist_ok=True)
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
     return cfg

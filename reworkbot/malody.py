@@ -17,9 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import zipfile
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +27,6 @@ logger = logging.getLogger(__name__)
 
 MALODY_MODE_KEY = 0
 SUPPORTED_KEYS = 4
-
-_AUDIO_SUFFIXES = {".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac"}
-_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
 
 
 def parse_beat(value: Any) -> float | None:
@@ -398,78 +393,35 @@ def _decode_json(raw: bytes) -> dict[str, Any]:
     return json.loads(decode_osu_text(raw))
 
 
-def read_malody_chart(data: bytes, filename: str, background: bytes | None = None) -> ConvertedChart:
-    """读取单个 .mc 字节流。"""
+def read_malody_chart(
+    data: bytes, filename: str, *, background_name: str = ""
+) -> ConvertedChart:
+    """读取单个 .mc 字节流并转换。"""
     try:
         mc = _decode_json(data)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise OsuSourceError(f"{filename} 不是有效的 Malody 谱面（JSON 解析失败：{exc}）。") from exc
     if not isinstance(mc, dict):
         raise OsuSourceError(f"{filename} 不是有效的 Malody 谱面。")
-    audio_name = ""
+    return convert_mc(
+        mc,
+        audio_name=pick_audio_name(mc),
+        background_name=background_name,
+    )
+
+
+def pick_audio_name(mc: dict[str, Any]) -> str:
+    """BGM 事件的 sound 字段是最权威的音频名。"""
     for note in mc.get("note") or []:
         if isinstance(note, dict) and _read_int(note.get("type"), 0) == 1 and note.get("sound"):
-            audio_name = Path(str(note["sound"])).name
-            break
-    return convert_mc(mc, audio_name=audio_name)
+            return Path(str(note["sound"])).name
+    return ""
 
 
-def read_malody_zip(data: bytes) -> list[tuple[str, ConvertedChart, bytes | None]]:
-    """读取 .mcz（zip）：返回 [(条目名, 转换结果, 背景图字节)]。"""
-    try:
-        archive = zipfile.ZipFile(BytesIO(data))
-    except zipfile.BadZipFile as exc:
-        raise OsuSourceError("该 .mcz 已损坏或不是有效的压缩包。") from exc
-
-    with archive:
-        names = [
-            name
-            for name in archive.namelist()
-            if not name.startswith("__MACOSX") and not name.endswith("/")
-        ]
-        mc_names = [name for name in names if Path(name).suffix.lower() == ".mc"]
-        if not mc_names:
-            raise OsuSourceError("该压缩包内没有找到任何 .mc 谱面文件。")
-
-        audio_name = ""
-        for name in names:
-            if Path(name).suffix.lower() in _AUDIO_SUFFIXES:
-                audio_name = Path(name).name
-                break
-
-        image_names = [name for name in names if Path(name).suffix.lower() in _IMAGE_SUFFIXES]
-        image_names.sort(key=lambda name: archive.getinfo(name).file_size, reverse=True)
-        fallback_image = image_names[0] if image_names else ""
-
-        results: list[tuple[str, ConvertedChart, bytes | None]] = []
-        for name in mc_names:
-            try:
-                mc = _decode_json(archive.read(name))
-            except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as exc:
-                logger.warning("  %s 解析失败：%s", name, exc)
-                continue
-
-            meta = mc.get("meta") or {}
-            background_name = str(meta.get("background") or "") or fallback_image
-            if background_name and Path(background_name).name != background_name:
-                background_name = Path(background_name).name
-            if background_name != fallback_image and background_name not in names:
-                background_name = fallback_image
-            background = archive.read(background_name) if background_name in names else None
-
-            # BGM 事件的 sound 字段是最权威的音频名
-            for note in mc.get("note") or []:
-                if isinstance(note, dict) and _read_int(note.get("type"), 0) == 1 and note.get("sound"):
-                    audio_name = Path(str(note["sound"])).name
-                    break
-
-            chart = convert_mc(
-                mc,
-                audio_name=audio_name,
-                background_name=Path(background_name).name if background_name else "",
-            )
-            results.append((Path(name).name, chart, background))
-        return results
+def background_name_of(mc: dict[str, Any]) -> str:
+    """取 .mc 里声明的背景图文件名（仅基名）。"""
+    name = str((mc.get("meta") or {}).get("background") or "")
+    return Path(name).name if name else ""
 
 
 def is_malody_payload(data: bytes) -> bool:
@@ -482,37 +434,3 @@ def is_malody_payload(data: bytes) -> bool:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return False
     return isinstance(obj, dict) and "note" in obj and ("meta" in obj or "time" in obj)
-
-
-def read_local_malody(path: str | Path) -> list[tuple[str, ConvertedChart, bytes | None]]:
-    """读取本地 .mc / .mcz。"""
-    file_path = Path(path)
-    if file_path.suffix.lower() == ".mcz":
-        return read_malody_zip(file_path.read_bytes())
-
-    data = file_path.read_bytes()
-    try:
-        mc = _decode_json(data)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise OsuSourceError(f"{file_path.name} 不是有效的 Malody 谱面。") from exc
-    if not isinstance(mc, dict):
-        raise OsuSourceError(f"{file_path.name} 不是有效的 Malody 谱面。")
-
-    background_name = str((mc.get("meta") or {}).get("background") or "")
-    background: bytes | None = None
-    if background_name:
-        sibling = file_path.parent / Path(background_name).name
-        if sibling.exists():
-            background = sibling.read_bytes()
-    if background:
-        background_name = Path(background_name).name
-    else:
-        background_name = ""
-
-    audio_name = ""
-    for note in mc.get("note") or []:
-        if isinstance(note, dict) and _read_int(note.get("type"), 0) == 1 and note.get("sound"):
-            audio_name = Path(str(note["sound"])).name
-            break
-    chart = convert_mc(mc, audio_name=audio_name, background_name=background_name)
-    return [(file_path.name, chart, background)]
