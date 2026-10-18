@@ -74,18 +74,21 @@ PRESET_OVERRIDES: dict[str, Any] = {
 }
 
 # 页面状态探针：返回星等 / 状态行 / 遮罩信息，供轮询等待与进度日志使用。
-_READY_CHECK_JS = """
+_READY_CHECK_JS = r"""
 () => {
   const star = document.querySelector('#rework-star');
   const status = document.querySelector('#status');
   const overlay = document.querySelector('#card-overlay');
   const text = star ? (star.textContent || '').trim() : '';
   const overlayVisible = Boolean(overlay && !overlay.hidden);
+  const statusText = status ? (status.textContent || '').trim() : '';
   return {
     ready: Boolean(star) && text !== '' && text !== '-' && !star.classList.contains('loading'),
     overlayVisible: overlayVisible,
+    // 插件内部报错（状态行以 [Error] 开头）时不再等待，直接按当前画面出图
+    error: /^\s*\[error\]/i.test(statusText),
     star: text,
-    status: status ? (status.textContent || '').trim() : '',
+    status: statusText,
     overlayTitle: overlayVisible
       ? ((document.querySelector('#overlay-title') || {}).textContent || '').trim() : '',
     overlayMessage: overlayVisible
@@ -353,7 +356,7 @@ class Renderer:
 
         while True:
             info = await page.evaluate(_READY_CHECK_JS)
-            if info["overlayVisible"]:
+            if info["overlayVisible"] or info["error"]:
                 return info
             if info["ready"]:
                 if info["star"] == prev_star:
@@ -388,14 +391,18 @@ class Renderer:
                 f"插件分析失败：{info['overlayTitle']} {info['overlayMessage']}".strip()
             )
 
-        star = str(info["star"]).strip()
-        if not star or star == "-":
-            raise RenderError("插件未能产出分析结果（星等为空）。")
-        # 插件内部报错时仍会画出星等，但状态行以 [Error] 开头 —— 这种结果是假的，不能发出去
         status_text = str(info.get("status") or "").strip()
-        if status_text.startswith("[Error]"):
-            raise RenderError(status_text)
-        logger.info("  分析完成：星等=%s（用时 %.1fs）", star, time.perf_counter() - load_started)
+        has_error = status_text.startswith("[Error]")
+
+        star = str(info["star"]).strip()
+        if not has_error and (not star or star == "-"):
+            raise RenderError("插件未能产出分析结果（星等为空）。")
+
+        if has_error:
+            # 插件内部报错时仍会画出卡片，按当前状态直接截图
+            logger.warning("  插件分析报错，按当前画面直接出图：%s", status_text)
+        else:
+            logger.info("  分析完成：星等=%s（用时 %.1fs）", star, time.perf_counter() - load_started)
 
         # 封面主题：正常运行时由 tosu 的 socket payload 触发，离线渲染没有 socket，
         # 这里直接调用插件自身的 coverTheme 模块，从 /files/beatmap/background 取色垫图。
@@ -418,7 +425,7 @@ class Renderer:
         final = await page.evaluate(_READY_CHECK_JS)
         final_status = str(final.get("status") or "")
         if final_status.startswith("[Error]"):
-            raise RenderError(final_status)
+            logger.warning("  卡片最终状态仍为报错，按现状截图：%s", final_status)
         logger.info(
             "  卡片就绪：谱面=%s  星等=%s",
             final_status or "未知",

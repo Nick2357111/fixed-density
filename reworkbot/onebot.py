@@ -54,6 +54,8 @@ class OneBotClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._counter = 0
         self._connected = asyncio.Event()
+        self._auth_failed = False
+        self._auth_warned = False
 
     # ------------------------------------------------------------------ 连接
     async def run(self) -> None:
@@ -68,7 +70,11 @@ class OneBotClient:
                     logger.warning("与 OneBot 的连接中断：%s", exc)
                 self._fail_pending(ConnectionError("与 OneBot 的连接已断开"))
                 self._connected.clear()
-                await asyncio.sleep(self.cfg.reconnect_delay_sec)
+                delay = self.cfg.reconnect_delay_sec
+                if self._auth_failed:
+                    # 鉴权失败时 NapCat 会接受连接再断开，退避以免刷屏
+                    delay = max(30.0, delay)
+                await asyncio.sleep(delay)
         finally:
             await self._session.close()
 
@@ -97,12 +103,34 @@ class OneBotClient:
             logger.debug("收到无法解析的负载：%s", raw[:200])
             return
 
+        # 鉴权失败：NapCat 会先接受连接、再发这条失败响应，然后断开
+        if payload.get("status") == "failed":
+            retcode = payload.get("retcode")
+            detail = str(payload.get("message") or payload.get("wording") or "")
+            if retcode == 1403 or "token" in detail.lower():
+                self._auth_failed = True
+                if not self._auth_warned:
+                    logger.error(
+                        "OneBot 鉴权失败（%s）：NapCat 的 WebSocket Token 与 config.json 的 "
+                        "onebot.access_token 不一致。改成同一个字符串后重启机器人即可。",
+                        detail or f"retcode={retcode}",
+                    )
+                    self._auth_warned = True
+            else:
+                logger.warning("OneBot 返回失败：%s", payload)
+
         echo = payload.get("echo")
         if echo is not None and echo in self._pending:
             future = self._pending.pop(echo)
             if not future.done():
                 future.set_result(payload)
             return
+
+        # 收到正常事件说明鉴权已通过
+        if payload.get("post_type"):
+            self._auth_failed = False
+            if payload.get("meta_event_type") == "lifecycle":
+                self._auth_warned = False
 
         if payload.get("post_type") == "message":
             asyncio.create_task(self._dispatch(payload))
