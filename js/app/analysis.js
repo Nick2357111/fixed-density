@@ -732,8 +732,8 @@ export async function fetchBeatmapFile(reason) {
                 applyDebugUseAmountPostProcess(mergedClusters, patternReport);
             } else if (pipelineResult?.patternReport || pipelineResult?.patternError) {
                 if (pipelineResult.patternError) {
+                    // 键型分析无法进行（如谱面近乎为空）：静默处理，不报错。
                     patternAnalysisError = new Error(pipelineResult.patternError);
-                    errors.push(`Pattern analyze failed: ${pipelineResult.patternError}`);
                 } else {
                     applyPatternData({
                         report: pipelineResult.patternReport,
@@ -745,15 +745,18 @@ export async function fetchBeatmapFile(reason) {
                 try {
                     applyPatternData(analyzePatternFromText(rawText));
                 } catch (error) {
+                    // 键型分析无法进行（如谱面近乎为空）：静默处理，不报错。
                     patternAnalysisError = error;
-                    errors.push(`Pattern analyze failed: ${error.message}`);
                 }
             }
 
             if (showsPattern) {
                 if (!(await waitForBodyRenderReady())) return;
-                if (patternAnalysisError) {
-                    renderBodySectionError("Pattern", patternAnalysisError.message);
+                const hasClusters = Array.isArray(mergedClusters) && mergedClusters.length > 0;
+                if (patternAnalysisError || !hasClusters) {
+                    // 谱面近乎为空 / 键型分析无法进行：不报错，也不显示键型内容。
+                    patternClustersEl.classList.remove("bars-live");
+                    patternClustersEl.innerHTML = "";
                 } else {
                     renderPatternClusters(mergedClusters);
                 }
